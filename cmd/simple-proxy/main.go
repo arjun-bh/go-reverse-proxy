@@ -9,10 +9,18 @@ import (
 	"time"
 )
 
+// Struct for one backend server
 type Backend struct {
 	Address string
 	Proxy   *httputil.ReverseProxy
 	Healthy bool
+}
+
+// Server Pool struct for the collection of backend servers
+type Pool struct {
+	mu       sync.Mutex
+	backends []*Backend
+	next     int
 }
 
 // Health check function
@@ -24,6 +32,35 @@ func checkHealth(client *http.Client, address string) bool {
 	defer response.Body.Close()
 
 	return response.StatusCode == http.StatusOK
+}
+
+// Method for selecting target backend (round robin + healthy)
+func (p *Pool) NextHealthy() *Backend {
+	p.mu.Lock()
+	var chosen *Backend
+	//Check to make sure Backend is healthy. If not, increment next and check next
+	for checked := 0; checked < len(p.backends); checked++ {
+		candidate := p.backends[p.next]
+		p.next = (p.next + 1) % len(p.backends)
+		if candidate.Healthy {
+			chosen = candidate
+			break
+		}
+	}
+	p.mu.Unlock()
+	return chosen
+}
+
+// ServeHTTP forwards to a healthy backend or returns 503
+func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	chosen := p.NextHealthy()
+
+	if chosen == nil {
+		http.Error(w, "no healthy backends", http.StatusServiceUnavailable)
+		return
+	}
+
+	chosen.Proxy.ServeHTTP(w, r)
 }
 
 func main() {
@@ -53,31 +90,9 @@ func main() {
 		})
 	}
 
-	var mu sync.Mutex
-	next := 0
-
-	//Round robin logic with locks
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		var chosen *Backend
-		//Check to make sure Backend is healthy. If not, increment next and check next
-		for checked := 0; checked < len(backends); checked++ {
-			candidate := backends[next]
-			next = (next + 1) % len(backends)
-			if candidate.Healthy {
-				chosen = candidate
-				break
-			}
-		}
-		mu.Unlock()
-
-		if chosen == nil {
-			http.Error(w, "no healthy backends", http.StatusServiceUnavailable)
-			return
-		}
-
-		chosen.Proxy.ServeHTTP(w, r)
-	})
+	pool := &Pool{
+		backends: backends,
+	}
 
 	//Define health check client
 	healthClient := &http.Client{
@@ -97,9 +112,9 @@ func main() {
 			for _, backend := range backends {
 				healthy := checkHealth(healthClient, backend.Address)
 
-				mu.Lock()
+				pool.mu.Lock()
 				backend.Healthy = healthy
-				mu.Unlock()
+				pool.mu.Unlock()
 
 				log.Printf("backend=%s healthy=%t", backend.Address, healthy)
 			}
@@ -109,7 +124,7 @@ func main() {
 	}()
 
 	log.Println("proxy listening on 127.0.0.1:8080")
-	err := http.ListenAndServe("127.0.0.1:8080", handler)
+	err := http.ListenAndServe("127.0.0.1:8080", pool)
 	if err != nil {
 		log.Fatal(err)
 	}
