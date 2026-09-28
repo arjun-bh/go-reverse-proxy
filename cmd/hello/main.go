@@ -17,6 +17,9 @@ func main() {
 		fmt.Fprintf(w, "backend=%s method=%s path=%s\n",
 			*id, r.Method, r.URL.Path)
 	})
+	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
 
 	err := http.ListenAndServe("127.0.0.1:"+*port, nil)
 	if err != nil {
